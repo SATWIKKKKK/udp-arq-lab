@@ -25,3 +25,4 @@ under the rules below. Course policy takes precedence over this file.
 | Date | Who | Files | Tool | Summary |
 | --- | --- | --- | --- | --- |
 | 2026-09-15 | Satwik | `udp_arq/packet.py`, `tests/test_packet.py`, `README.md` | GitHub Copilot | Wire format, self-tests, frozen-spec draft |
+| 2026-09-17 | Pratik | `udp_arq/checksum.py`, `udp_arq/file_layer.py`, tests | ChatGPT | Renamed to match spec, added checksum/file-layer implementation and tests |
