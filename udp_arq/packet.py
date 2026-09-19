@@ -37,7 +37,9 @@ FLAG_FIN = 0x04
 KNOWN_FLAGS = FLAG_DATA | FLAG_ACK | FLAG_FIN
 
 DEFAULT_MSS = 1024
-MAX_PAYLOAD = 0xFFFF
+# A packet is header + payload, and a UDP/IPv4 datagram tops out at 65507
+# bytes, so the payload can be at most 65507 - HEADER_SIZE.
+MAX_PAYLOAD = 65507 - HEADER_SIZE
 
 
 class PacketError(ValueError):
