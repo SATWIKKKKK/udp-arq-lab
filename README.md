@@ -39,7 +39,8 @@ Fixed 16-byte header, all fields big-endian (`struct` format string
 | 12 | 2 | payload_len | uint16 | bytes after the header; must equal `len(payload)` |
 | 14 | 2 | magic | uint16 | must equal `MAGIC` (`0xA55A`) |
 
-Limits: payload 0 .. `MAX_PAYLOAD` = 65535 bytes; default `MSS` = 1024.
+Limits: payload 0 .. `MAX_PAYLOAD` = 65491 bytes (65507-byte UDP/IPv4
+datagram ceiling minus the 16-byte header); default `MSS` = 1024.
 
 `decode()` raises `PacketError` for: buffer shorter than 16 bytes, wrong
 magic, wrong version, unknown flag bits, or `payload_len` that disagrees
@@ -103,6 +104,26 @@ class Transport(ABC):
 `NullTransport` is the zero-retransmit passthrough that proves this
 interface end-to-end before any ARQ logic exists.
 
+## Stop-and-Wait transport (Satwik)
+
+`StopAndWaitTransport(Transport)`: classic alternating-bit protocol, one
+packet in flight per peer address at a time.
+
+- `sendto`: sends the DATA packet, then blocks until an ACK with
+  `ack == seq ^ 1` arrives or the per-attempt `timeout` expires, in which
+  case it retransmits the same packet. Sequence numbers alternate 0/1 per
+  destination address.
+- `recvfrom`: on a fresh in-order DATA packet, delivers the payload and
+  ACKs with the next expected sequence number. On a duplicate (the
+  previous ACK was lost, not the data), it re-sends that same ACK but does
+  not redeliver the payload.
+- Corrupted or malformed packets (bad checksum, `PacketError`) are
+  silently dropped on both sides, same as `NullTransport`.
+
+Done when: Stop-and-Wait moves a file through the emulator at 0% loss,
+then 10% loss, with SHA-256 matching on both ends
+(`tests/test_stop_and_wait.py::test_file_transfer_sha256_matches`).
+
 ## File layer + transfer harness (Pratik + Sagnik)
 
 - `chunk(data, mss=DEFAULT_MSS) -> list[bytes]`
@@ -128,9 +149,10 @@ udp-arq-lab/
 │   ├── channel.py        # Ahana
 │   └── transport/
 │       ├── __init__.py
-│       ├── base.py       # Sagnik — frozen interface
-│       └── null.py       # Sagnik — passthrough proof
-└── tests/                # Pratik & Sagnik (+ packet self-tests)
+│       ├── base.py             # Sagnik — frozen interface
+│       ├── null.py             # Sagnik — passthrough proof
+│       └── stop_and_wait.py    # Satwik — week 3 target
+└── tests/                # Pratik & Sagnik (+ packet/channel/S&W self-tests)
 ```
 
 ## Run tests
@@ -141,18 +163,19 @@ python -m pytest -q
 
 ## Definition of done
 
-- **Satwik** — round-trip holds for empty, random, and max payloads; garbage
-  and truncated input raises cleanly. (Self-tests: `tests/test_packet.py`)
-- **Pratik** — all single-bit flips in a 1000-packet sample caught; 10 MiB
+- **Satwik** — ✅ round-trip holds for empty, random, and max payloads;
+  garbage and truncated input raises cleanly. (Self-tests: `tests/test_packet.py`)
+- **Pratik** — ✅ all single-bit flips in a 1000-packet sample caught; 10 MiB
   file survives chunk → reassemble with matching SHA-256.
-- **Ahana** — same seed ⇒ identical drop sequence twice; 10k packets within
-  ~1% of configured loss.
-- **Sagnik** — `pytest` green; null transport moves a file through the
-  emulator at 0% loss.
-- **Integration checkpoint (day 5)** — everything merges; null transport
+- **Ahana** — ✅ same seed ⇒ identical drop sequence twice; 10k packets
+  within ~1% of configured loss. (`tests/test_channel.py`)
+- **Sagnik** — ✅ `pytest` green; null transport moves a file through the
+  emulator at 0% loss. (`tests/test_transport.py::test_file_transfer_harness`)
+- **Integration checkpoint (day 5)** — ✅ everything merges; null transport
   carries a real file at 0% loss with hashes matching. That is week 3's
   start line.
-- **Week 3 target** — Stop-and-Wait at 0%, then 10% loss, SHA-256 matching.
+- **Week 3 target** — ✅ Stop-and-Wait at 0%, then 10% loss, SHA-256
+  matching. (`tests/test_stop_and_wait.py::test_file_transfer_sha256_matches`)
 
 ## Git rules (from kickoff)
 
