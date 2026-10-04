@@ -5,8 +5,12 @@ Go-Back-N provides reliable delivery using a sliding window.
 Multiple DATA packets may be outstanding at once. ACKs are cumulative:
 an ACK value represents the next sequence number expected by the receiver.
 
-sendto() places data into an internal outbound queue and waits until the
-packet's sequence number is cumulatively acknowledged.
+sendto() places data into an internal outbound queue and returns
+immediately; flush() waits until every datagram handed over so far has
+been cumulatively acknowledged. This keeps the sliding window full when
+the application produces datagrams sequentially (a blocking sendto would
+cap the pipeline depth at one packet, making GBN degenerate into
+Stop-and-Wait).
 
 A background thread is responsible for:
     - moving queued packets into the transmission window,
@@ -206,14 +210,75 @@ class GoBackNTransport(Transport):
 
             self._outbound.put(item)
 
-        # Block until the cumulative ACK covers this sequence number.
-        item["event"].wait()
+        # Return without waiting: the background thread sends the packet
+        # when window space is available. Callers that need delivery
+        # confirmation (or error propagation) call flush().
 
-        if item["error"] is not None:
-            raise item["error"]
+    def flush(
+        self,
+        addr: Address | None = None,
+        timeout: float = 60.0,
+    ) -> None:
+        """Block until every datagram handed to sendto() so far is ACKed.
 
-        if self._stop_event.is_set():
-            raise RuntimeError("transport is closed")
+        ``addr=None`` waits for all peers. Raises the first per-packet
+        error (e.g. TimeoutError after MAX_RETRIES, or RuntimeError if
+        the transport was closed) and ``TimeoutError`` if ``timeout``
+        seconds pass with datagrams still unacknowledged.
+        """
+
+        deadline = time.monotonic() + timeout
+
+        while True:
+            with self._lock:
+                if addr is not None:
+                    addrs = [addr]
+                else:
+                    addrs = sorted(
+                        set(self._pending)
+                        | set(self._sent_items)
+                    )
+
+                items: list[dict] = []
+
+                for a in addrs:
+                    items.extend(
+                        self._pending.get(a, {}).values()
+                    )
+                    items.extend(
+                        self._sent_items.get(a, {}).values()
+                    )
+
+                if addr is None and not self._outbound.empty():
+                    items.extend(
+                        list(self._outbound.queue)
+                    )
+
+            errors = [
+                item["error"]
+                for item in items
+                if item["error"] is not None
+            ]
+
+            if errors:
+                raise errors[0]
+
+            if not items:
+                return
+
+            remaining = deadline - time.monotonic()
+
+            if remaining <= 0:
+                raise TimeoutError(
+                    "flush timed out: "
+                    "datagrams still unacknowledged"
+                )
+
+            # Hop briefly: wait on one representative event, then
+            # re-snapshot so items ACKed in the meantime disappear.
+            items[0]["event"].wait(
+                min(0.05, remaining)
+            )
 
     # ================================================================
     # Public receiver API
@@ -452,15 +517,6 @@ class GoBackNTransport(Transport):
                 with self._lock:
                     base = self._base.get(addr, 0)
 
-                    next_seq = self._next_seq.get(
-                        addr,
-                        base,
-                    )
-
-                    # Window is full.
-                    if next_seq >= base + self.window_size:
-                        break
-
                     pending = self._pending.get(addr)
 
                     if not pending:
@@ -468,6 +524,14 @@ class GoBackNTransport(Transport):
 
                     # Always send the oldest pending sequence first.
                     seq = min(pending)
+
+                    # Window is full when the oldest waiting packet lies
+                    # outside [base, base + window_size). Basing this on
+                    # _next_seq (the assignment counter) is wrong once
+                    # several sendto() calls are queued up.
+                    if seq >= base + self.window_size:
+                        break
+
                     item = pending.pop(seq)
 
                     # Build DATA packet.

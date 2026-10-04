@@ -11,6 +11,7 @@ channel is loss-free so ACKs are not lost.
 
 import os
 import threading
+import time
 
 import pytest
 
@@ -77,6 +78,7 @@ def test_single_datagram_round_trip() -> None:
         t.start()
 
         sender.sendto(b"hello", addr)
+        sender.flush()
 
         t.join(timeout=3.0)
 
@@ -115,6 +117,8 @@ def test_ordered_datagrams_survive_multiple() -> None:
 
         for payload in payloads:
             sender.sendto(payload, addr)
+
+        sender.flush()
 
         t.join(timeout=10.0)
 
@@ -243,6 +247,8 @@ def test_file_transfer_sha256_matches(loss: float) -> None:
         for piece in chunks:
             sender.sendto(piece, addr)
 
+        sender.flush()
+
         t.join(timeout=60.0)
 
         assert len(received_chunks) == len(chunks)
@@ -288,6 +294,8 @@ def test_window_size_one() -> None:
         for piece in chunks:
             sender.sendto(piece, addr)
 
+        sender.flush()
+
         t.join(timeout=30.0)
 
         assert len(received_chunks) == len(chunks)
@@ -295,6 +303,70 @@ def test_window_size_one() -> None:
         rebuilt = reassemble(received_chunks)
 
         assert sha256_hex(rebuilt) == sha256_hex(data)
+
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_window_pipelines_multiple_datagrams() -> None:
+    """A window of 4 must actually pipeline: with 0.3 s of delay on the
+    sender's channel, 8 datagrams should finish well under the 8 * 0.3 s
+    a serialized (window=1) sender would need."""
+
+    sender_ch = Channel(
+        LOCALHOST,
+        delay=0.3,
+        seed=5,
+    )
+
+    receiver_ch = Channel(LOCALHOST)
+
+    sender = GoBackNTransport(
+        sender_ch,
+        timeout=0.2,
+        window_size=4,
+    )
+
+    receiver = GoBackNTransport(
+        receiver_ch,
+        timeout=0.2,
+        window_size=4,
+    )
+
+    try:
+        addr = receiver.channel.local_addr
+
+        payloads = [
+            f"packet-{i}".encode()
+            for i in range(8)
+        ]
+
+        received: list[bytes] = []
+
+        def receive_all() -> None:
+            for _ in payloads:
+                data, _ = receiver.recvfrom(timeout=10.0)
+                received.append(data)
+
+        t = threading.Thread(target=receive_all)
+        t.start()
+
+        start = time.monotonic()
+
+        for payload in payloads:
+            sender.sendto(payload, addr)
+
+        sender.flush()
+        elapsed = time.monotonic() - start
+
+        t.join(timeout=10.0)
+
+        assert received == payloads
+
+        # Serialized delivery would take >= 8 * 0.3 = 2.4 s.
+        # A working window keeps it well below that.
+        assert elapsed < 2.0
 
     finally:
         sender.close()
