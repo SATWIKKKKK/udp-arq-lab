@@ -1,6 +1,6 @@
-"""Go-Back-N ARQ transport (owner: Pratik).
+"""Selective Repeat ARQ transport (owner: Sagnik).
 
-Go-Back-N provides reliable delivery using a sliding window.
+Selective Repeat provides reliable delivery using a sliding window.
 
 Multiple DATA packets may be outstanding at once. ACKs are cumulative:
 an ACK value represents the next sequence number expected by the receiver.
@@ -9,7 +9,7 @@ sendto() places data into an internal outbound queue and returns
 immediately; flush() waits until every datagram handed over so far has
 been cumulatively acknowledged. This keeps the sliding window full when
 the application produces datagrams sequentially (a blocking sendto would
-cap the pipeline depth at one packet, making GBN degenerate into
+cap the pipeline depth at one packet, making SR degenerate into
 Stop-and-Wait).
 
 A background thread is responsible for:
@@ -46,6 +46,7 @@ from udp_arq.packet import (
     encode,
 )
 from udp_arq.transport.base import Address, Transport
+from udp_arq.timer_heap import TimerHeap
 
 
 # Safety cap so 100% loss eventually fails instead of hanging forever.
@@ -75,8 +76,8 @@ def _encode_with_checksum(header: Header, payload: bytes) -> bytes:
     )
 
 
-class GoBackNTransport(Transport):
-    """Reliable sliding-window transport using Go-Back-N ARQ."""
+class SelectiveRepeatTransport(Transport):
+    """Reliable sliding-window transport using Selective Repeat ARQ."""
 
     def __init__(
         self,
@@ -107,7 +108,7 @@ class GoBackNTransport(Transport):
         # Next sequence number to assign per peer.
         self._next_seq: dict[Address, int] = {}
 
-        # Encoded packets currently outstanding in the GBN window.
+        # Encoded packets currently outstanding in the SR window.
         #
         # Example:
         #
@@ -127,12 +128,17 @@ class GoBackNTransport(Transport):
         # Packets waiting to enter the transmission window.
         self._pending: dict[Address, dict[int, dict]] = {}
 
-        # One timer deadline per peer.
-        # It represents the oldest outstanding packet.
-        self._timer_deadline: dict[Address, float | None] = {}
+        # Timer heap for per-packet timeouts.
+        self._timer_heap = TimerHeap()
 
-        # Number of timeout retransmissions for the current window.
+        # Number of consecutive timeout events per peer (for max retries).
         self._retries: dict[Address, int] = {}
+        
+        # Track which packets have been retransmitted (for week 6 Karn's algorithm).
+        self._retransmitted: dict[Address, set[int]] = {}
+        
+        # Total retransmissions (for stats).
+        self.retransmissions = 0
 
         # ============================================================
         # Receiver state
@@ -140,6 +146,9 @@ class GoBackNTransport(Transport):
 
         # Next sequence number expected from each peer.
         self._expected: dict[Address, int] = {}
+
+        # Out-of-order packet buffer per peer.
+        self._buffer: dict[Address, dict[int, bytes]] = {}
 
         # In-order DATA payloads waiting for the application.
         #
@@ -166,7 +175,7 @@ class GoBackNTransport(Transport):
         # This is the ONLY thread that calls channel.recvfrom().
         self._sender_thread = threading.Thread(
             target=self._sender_loop,
-            name="gbn-sender",
+            name="sr-sender",
             daemon=True,
         )
 
@@ -181,7 +190,7 @@ class GoBackNTransport(Transport):
         data: bytes,
         addr: Address,
     ) -> None:
-        """Reliably deliver one datagram using Go-Back-N."""
+        """Reliably deliver one datagram using Selective Repeat."""
 
         if len(data) > self.mss:
             raise ValueError(
@@ -419,30 +428,29 @@ class GoBackNTransport(Transport):
 
         with self._lock:
             expected = self._expected.get(addr, 0)
+            buffer = self._buffer.setdefault(addr, {})
 
-            if header.seq == expected:
-                # Correct in-order packet.
-                self._expected[addr] = expected + 1
-
-                # ACK means:
-                # "this is the next sequence number I expect."
-                ack_for = expected + 1
-
-                deliver = True
-
+            if expected <= header.seq < expected + self.window_size:
+                # Inside window
+                buffer[header.seq] = payload
+                ack_for = header.seq + 1
+            elif header.seq < expected:
+                # Duplicate, already delivered, still need to ACK it
+                ack_for = header.seq + 1
             else:
-                # Out-of-order or duplicate packet.
-                #
-                # Go-Back-N does NOT buffer it.
-                #
-                # Re-send the cumulative ACK for the current expected
-                # sequence number.
+                # Outside window (too far ahead)
                 ack_for = expected
 
-                deliver = False
+            # Deliver in-order packets
+            deliver_queue = []
+            while expected in buffer:
+                deliver_queue.append(buffer.pop(expected))
+                expected += 1
+            
+            self._expected[addr] = expected
 
         # ------------------------------------------------------------
-        # Send cumulative ACK immediately.
+        # Send individual ACK immediately.
         # ------------------------------------------------------------
 
         ack_packet = _encode_with_checksum(
@@ -468,10 +476,8 @@ class GoBackNTransport(Transport):
         # Deliver only an in-order packet.
         # ------------------------------------------------------------
 
-        if deliver:
-            self._incoming_data.put(
-                (payload, addr)
-            )
+        for p in deliver_queue:
+            self._incoming_data.put((p, addr))
 
     # ================================================================
     # Move outbound queue -> pending
@@ -497,8 +503,9 @@ class GoBackNTransport(Transport):
                 self._base.setdefault(addr, seq)
                 self._outstanding.setdefault(addr, {})
                 self._sent_items.setdefault(addr, {})
-                self._timer_deadline.setdefault(addr, None)
                 self._retries.setdefault(addr, 0)
+                self._retransmitted.setdefault(addr, set())
+                self._buffer.setdefault(addr, {})
 
     # ================================================================
     # Window pump
@@ -561,16 +568,8 @@ class GoBackNTransport(Transport):
 
                     self._sent_items[addr][seq] = item
 
-                    # Start ONE timer when the first packet enters
-                    # an otherwise-empty window.
-                    if (
-                        self._base.get(addr) == seq
-                        and self._timer_deadline.get(addr) is None
-                    ):
-                        self._timer_deadline[addr] = (
-                            time.monotonic()
-                            + self.timeout
-                        )
+                    # Start a timer for EACH packet sent.
+                    self._timer_heap.schedule((addr, seq), time.monotonic() + self.timeout)
 
                 # Do channel I/O outside the lock.
                 try:
@@ -596,7 +595,7 @@ class GoBackNTransport(Transport):
                         item["event"].set()
 
                         if not self._outstanding.get(addr):
-                            self._timer_deadline[addr] = None
+                            self._timer_heap.cancel((addr, seq))
 
     # ================================================================
     # ACK handling
@@ -633,122 +632,62 @@ class GoBackNTransport(Transport):
 
             ack = header.ack
 
-            # Stale ACK.
+            # Wait, in SR, an ACK for seq < base is valid but already processed. 
             if ack <= base:
-                return
+                pass # Already advanced base past this
 
             # ACK cannot go beyond packets assigned by sendto().
             if ack > next_seq:
                 return
 
             # --------------------------------------------------------
-            # Cumulative ACK:
+            # Individual ACK (Selective Repeat):
             #
-            # ACK 5 means:
-            #     0,1,2,3,4 are acknowledged
-            #     5 is the next expected sequence number
+            # ACK N means: packet (N-1) is acknowledged.
             # --------------------------------------------------------
-
-            self._base[addr] = ack
-
-            outstanding = self._outstanding.get(
-                addr,
-                {},
-            )
-
-            sent_items = self._sent_items.get(
-                addr,
-                {},
-            )
-
-            # Everything below ACK is acknowledged.
-            acknowledged = [
-                seq
-                for seq in list(outstanding)
-                if seq < ack
-            ]
-
-            for seq in acknowledged:
-
-                outstanding.pop(
-                    seq,
-                    None,
-                )
-
-                item = sent_items.pop(
-                    seq,
-                    None,
-                )
-
+            
+            acked_seq = ack - 1
+            
+            outstanding = self._outstanding.get(addr, {})
+            sent_items = self._sent_items.get(addr, {})
+            
+            if acked_seq in outstanding:
+                outstanding.pop(acked_seq)
+                item = sent_items.pop(acked_seq, None)
                 if item is not None:
                     item["event"].set()
-
-            # ACK progress resets retry count.
-            self._retries[addr] = 0
-
-            # --------------------------------------------------------
-            # Timer handling.
-            # --------------------------------------------------------
-
-            if self._base[addr] < next_seq:
-
-                # There are still outstanding packets.
-                self._timer_deadline[addr] = (
-                    time.monotonic()
-                    + self.timeout
-                )
-
-            else:
-
-                # Everything has been acknowledged.
-                self._timer_deadline[addr] = None
+                    
+                self._timer_heap.cancel((addr, acked_seq))
+                
+                # Advance base past all acknowledged packets
+                while base < next_seq and base not in outstanding:
+                    base += 1
+                self._base[addr] = base
+                
+                # Progress resets retry count
+                self._retries[addr] = 0
 
     # ================================================================
     # Timeout / retransmission
     # ================================================================
 
     def _handle_timeouts(self) -> None:
-        """Retransmit the complete outstanding window after timeout."""
+        """Retransmit specific unacknowledged packets after timeout."""
 
         now = time.monotonic()
-
+        
         with self._lock:
-            addresses = list(
-                self._timer_deadline.keys()
-            )
-
-        for addr in addresses:
-
-            with self._lock:
-                deadline = self._timer_deadline.get(addr)
-
-                if deadline is None:
-                    continue
-
-                if now < deadline:
-                    continue
-
-                outstanding = dict(
-                    self._outstanding.get(
-                        addr,
-                        {},
-                    )
-                )
-
-                if not outstanding:
-                    self._timer_deadline[addr] = None
-                    continue
-
-                # One timeout = one retry.
-                self._retries[addr] = (
-                    self._retries.get(addr, 0)
-                    + 1
-                )
-
-                retries = self._retries[addr]
-
-                if retries > MAX_RETRIES:
-
+            due_keys = self._timer_heap.pop_due(now)
+            
+            # Group by address to handle MAX_RETRIES efficiently
+            due_by_addr = {}
+            for addr, seq in due_keys:
+                if addr in self._outstanding and seq in self._outstanding[addr]:
+                    due_by_addr.setdefault(addr, []).append(seq)
+                    
+            for addr, seqs in due_by_addr.items():
+                self._retries[addr] = self._retries.get(addr, 0) + 1
+                if self._retries[addr] > MAX_RETRIES:
                     self._fail_peer(
                         addr,
                         TimeoutError(
@@ -757,41 +696,25 @@ class GoBackNTransport(Transport):
                             f"retransmissions"
                         ),
                     )
-
                     continue
-
-            # --------------------------------------------------------
-            # Go-Back-N:
-            #
-            # Retransmit ALL outstanding packets.
-            # --------------------------------------------------------
-
-            for seq in sorted(outstanding):
-
-                packet = outstanding[seq]
-
-                try:
-                    self.channel.sendto(
-                        packet,
-                        addr,
-                    )
-
-                except Exception as exc:
-                    self._fail_peer(
-                        addr,
-                        exc,
-                    )
-
-                    break
-
-            # Restart timer for the same oldest outstanding packet.
-            with self._lock:
-                if self._outstanding.get(addr):
-
-                    self._timer_deadline[addr] = (
-                        time.monotonic()
-                        + self.timeout
-                    )
+                    
+                for seq in seqs:
+                    # Double check it is still outstanding
+                    packet = self._outstanding[addr].get(seq)
+                    if packet is None:
+                        continue
+                        
+                    self.retransmissions += 1
+                    self._retransmitted.setdefault(addr, set()).add(seq)
+                    
+                    # Reschedule timer
+                    self._timer_heap.schedule((addr, seq), time.monotonic() + self.timeout)
+                    
+                    try:
+                        self.channel.sendto(packet, addr)
+                    except Exception as exc:
+                        self._fail_peer(addr, exc)
+                        break
 
     # ================================================================
     # Timer calculation
@@ -806,15 +729,9 @@ class GoBackNTransport(Transport):
         wait = 0.05
 
         with self._lock:
-            deadlines = [
-                deadline
-                for deadline in self._timer_deadline.values()
-                if deadline is not None
-            ]
+            nearest = self._timer_heap.nearest()
 
-        if deadlines:
-            nearest = min(deadlines)
-
+        if nearest is not None:
             wait = max(
                 0.0,
                 min(
