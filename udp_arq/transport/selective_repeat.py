@@ -45,6 +45,7 @@ from udp_arq.packet import (
     decode,
     encode,
 )
+from udp_arq.rto import RTOEstimator
 from udp_arq.transport.base import Address, Transport
 from udp_arq.timer_heap import TimerHeap
 
