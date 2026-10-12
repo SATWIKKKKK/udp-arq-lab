@@ -29,6 +29,7 @@ from udp_arq.packet import (
     decode,
     encode,
 )
+from udp_arq.rto import RTOEstimator
 from udp_arq.transport.base import Address, Transport
 
 # Safety cap on retransmissions so a bug (or 100% loss) fails loudly with a
@@ -61,8 +62,17 @@ def _encode_with_checksum(header: Header, payload: bytes) -> bytes:
 class StopAndWaitTransport(Transport):
     """Reliable single-datagram delivery, one packet in flight at a time."""
 
-    def __init__(self, channel, *, mss: int = DEFAULT_MSS, timeout: float = 0.5):
+    def __init__(
+        self,
+        channel,
+        *,
+        mss: int = DEFAULT_MSS,
+        timeout: float = 0.5,
+        adaptive: bool = False,
+    ):
         super().__init__(channel, mss=mss, timeout=timeout)
+        self.adaptive = adaptive
+        self._rto: dict[Address, RTOEstimator] = {}
         self._send_bit: dict[Address, int] = {}
         self._recv_bit: dict[Address, int] = {}
 
@@ -71,14 +81,24 @@ class StopAndWaitTransport(Transport):
         if len(data) > self.mss:
             raise ValueError(f"payload size {len(data)} > mss {self.mss}")
 
+        rto = self._rto.setdefault(
+            addr,
+            RTOEstimator(
+                initial_rto=self.timeout,
+                min_rto=min(0.1, self.timeout),
+            ),
+        )
+
         seq = self._send_bit.get(addr, 0)
         packet = _encode_with_checksum(
             Header(seq=seq, ack=0, flags=FLAG_DATA, payload_len=len(data)), data
         )
 
-        for _ in range(MAX_RETRIES):
+        for attempt in range(MAX_RETRIES):
+            sent_at = time.monotonic()
             self.channel.sendto(packet, addr)
-            deadline = time.monotonic() + self.timeout
+            attempt_timeout = rto.rto if self.adaptive else self.timeout
+            deadline = sent_at + attempt_timeout
 
             while True:
                 remaining = deadline - time.monotonic()
@@ -100,8 +120,17 @@ class StopAndWaitTransport(Transport):
                     continue
                 if header.ack == (seq ^ 1):
                     self._send_bit[addr] = seq ^ 1
+                    # Karn: attempt 0 is the fresh transmission; later
+                    # attempts are retransmits and must not be sampled.
+                    if self.adaptive and attempt == 0:
+                        rto.sample(time.monotonic() - sent_at)
                     return
                 # Stale ACK for a previous packet: keep waiting for ours.
+
+            # This attempt timed out: exponential backoff.
+            if self.adaptive:
+                rto.on_timeout()
+
         raise TimeoutError(
             f"no ACK for seq {seq} to {addr} after {MAX_RETRIES} retransmissions"
         )

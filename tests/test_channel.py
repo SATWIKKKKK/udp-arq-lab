@@ -64,7 +64,9 @@ def impairment_sequence(
             Total number of datagrams handed to the real socket.
 
         received:
-            Payload bytes in actual arrival order.
+            Payload bytes, sorted. Arrival order is timing-dependent
+            (absolute deliver_at values depend on the wall clock), so
+            only order-insensitive comparisons are deterministic.
     """
     dropped_flags: list[bool] = []
     received: list[bytes] = []
@@ -101,7 +103,7 @@ def impairment_sequence(
             data, _ = receiver.recvfrom(timeout=3.0)
             received.append(data)
 
-        return dropped_flags, sender.delivered, received
+        return dropped_flags, sender.delivered, sorted(received)
 
     finally:
         # sender may already be closed.
@@ -312,7 +314,14 @@ def test_negative_timeout_rejected() -> None:
 
 
 def test_same_seed_gives_identical_impairment_sequence() -> None:
-    """Same seed must produce the same five-draw impairment sequence."""
+    """Same seed must produce identical per-packet impairment outcomes
+    (drop flags, delivered count, and the multiset of delivered bytes).
+
+    Arrival ORDER is intentionally not compared: delivery times are
+    absolute wall-clock times, so the same seed can deliver two packets
+    in a different order across runs while every per-packet draw is
+    identical.
+    """
 
     first = impairment_sequence(seed=42)
     second = impairment_sequence(seed=42)

@@ -45,6 +45,7 @@ from udp_arq.packet import (
     decode,
     encode,
 )
+from udp_arq.rto import RTOEstimator
 from udp_arq.transport.base import Address, Transport
 
 
@@ -85,6 +86,7 @@ class GoBackNTransport(Transport):
         mss: int = DEFAULT_MSS,
         timeout: float = 0.5,
         window_size: int = 4,
+        adaptive: bool = False,
     ):
         super().__init__(
             channel,
@@ -133,6 +135,24 @@ class GoBackNTransport(Transport):
 
         # Number of timeout retransmissions for the current window.
         self._retries: dict[Address, int] = {}
+
+        # ============================================================
+        # Adaptive RTO state (Jacobson/Karels + Karn).
+        #
+        # Used only when ``adaptive=True``; the fixed-timeout path
+        # stays byte-for-byte identical to Week 4.
+        # ============================================================
+
+        self.adaptive = adaptive
+
+        # RTO estimator per peer.
+        self._rto: dict[Address, RTOEstimator] = {}
+
+        # Send timestamp per outstanding seq (for RTT samples).
+        self._send_time: dict[Address, dict[int, float]] = {}
+
+        # Seqs sent as retransmissions (Karn: never sample those).
+        self._retransmitted: dict[Address, set[int]] = {}
 
         # ============================================================
         # Receiver state
@@ -499,6 +519,15 @@ class GoBackNTransport(Transport):
                 self._sent_items.setdefault(addr, {})
                 self._timer_deadline.setdefault(addr, None)
                 self._retries.setdefault(addr, 0)
+                self._rto.setdefault(
+                    addr,
+                    RTOEstimator(
+                        initial_rto=self.timeout,
+                        min_rto=min(0.1, self.timeout),
+                    ),
+                )
+                self._send_time.setdefault(addr, {})
+                self._retransmitted.setdefault(addr, set())
 
     # ================================================================
     # Window pump
@@ -561,6 +590,11 @@ class GoBackNTransport(Transport):
 
                     self._sent_items[addr][seq] = item
 
+                    # Record the send time for RTT sampling.
+                    self._send_time.setdefault(addr, {})[seq] = (
+                        time.monotonic()
+                    )
+
                     # Start ONE timer when the first packet enters
                     # an otherwise-empty window.
                     if (
@@ -569,7 +603,7 @@ class GoBackNTransport(Transport):
                     ):
                         self._timer_deadline[addr] = (
                             time.monotonic()
-                            + self.timeout
+                            + self._rto_value(addr)
                         )
 
                 # Do channel I/O outside the lock.
@@ -687,6 +721,32 @@ class GoBackNTransport(Transport):
             self._retries[addr] = 0
 
             # --------------------------------------------------------
+            # Adaptive RTO (Jacobson/Karels + Karn).
+            # --------------------------------------------------------
+
+            if self.adaptive:
+                send_times = self._send_time.setdefault(addr, {})
+                retransmitted = self._retransmitted.setdefault(
+                    addr, set()
+                )
+
+                # ``base`` here is the OLD base; the ACK advancing it
+                # is effectively an ACK for the oldest outstanding
+                # packet. Karn: sample only if that packet was not a
+                # retransmission (ambiguous ACKs must not feed SRTT).
+                if (
+                    base in send_times
+                    and base not in retransmitted
+                ):
+                    rtt = time.monotonic() - send_times[base]
+                    self._rto[addr].sample(rtt)
+
+                # Drop bookkeeping for everything now acknowledged.
+                for seq in acknowledged:
+                    send_times.pop(seq, None)
+                    retransmitted.discard(seq)
+
+            # --------------------------------------------------------
             # Timer handling.
             # --------------------------------------------------------
 
@@ -695,7 +755,7 @@ class GoBackNTransport(Transport):
                 # There are still outstanding packets.
                 self._timer_deadline[addr] = (
                     time.monotonic()
-                    + self.timeout
+                    + self._rto_value(addr)
                 )
 
             else:
@@ -706,6 +766,12 @@ class GoBackNTransport(Transport):
     # ================================================================
     # Timeout / retransmission
     # ================================================================
+
+    def _rto_value(self, addr: Address) -> float:
+        """Current retransmission timeout for a peer."""
+        if not self.adaptive:
+            return self.timeout
+        return self._rto[addr].rto
 
     def _handle_timeouts(self) -> None:
         """Retransmit the complete outstanding window after timeout."""
@@ -770,6 +836,14 @@ class GoBackNTransport(Transport):
 
                 packet = outstanding[seq]
 
+                # Karn's algorithm: this packet is now ambiguous, so
+                # its eventual ACK must never feed an RTT sample.
+                if self.adaptive:
+                    with self._lock:
+                        self._retransmitted.setdefault(
+                            addr, set()
+                        ).add(seq)
+
                 try:
                     self.channel.sendto(
                         packet,
@@ -784,13 +858,16 @@ class GoBackNTransport(Transport):
 
                     break
 
-            # Restart timer for the same oldest outstanding packet.
+            # Restart timer (with exponential backoff in adaptive mode).
             with self._lock:
                 if self._outstanding.get(addr):
 
+                    if self.adaptive:
+                        self._rto[addr].on_timeout()
+
                     self._timer_deadline[addr] = (
                         time.monotonic()
-                        + self.timeout
+                        + self._rto_value(addr)
                     )
 
     # ================================================================
