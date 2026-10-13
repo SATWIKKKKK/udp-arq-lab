@@ -695,7 +695,7 @@ class SelectiveRepeatTransport(Transport):
                         acked_seq in send_times
                         and acked_seq not in retransmitted
                     ):
-                        rtt = time.monotonic() - send_times[acked_seq]
+                        rtt = max(1e-4, time.monotonic() - send_times[acked_seq])
                         self._rto[addr].sample(rtt)
                     send_times.pop(acked_seq, None)
                     retransmitted.discard(acked_seq)
