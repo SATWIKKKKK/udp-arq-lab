@@ -45,6 +45,7 @@ from udp_arq.packet import (
     decode,
     encode,
 )
+from udp_arq.rto import RTOEstimator
 from udp_arq.transport.base import Address, Transport
 from udp_arq.timer_heap import TimerHeap
 
@@ -86,6 +87,7 @@ class SelectiveRepeatTransport(Transport):
         mss: int = DEFAULT_MSS,
         timeout: float = 0.5,
         window_size: int = 4,
+        adaptive: bool = False,
     ):
         super().__init__(
             channel,
@@ -97,6 +99,13 @@ class SelectiveRepeatTransport(Transport):
             raise ValueError("window_size must be greater than zero")
 
         self.window_size = window_size
+        self.adaptive = adaptive
+
+        # RTO estimator per peer (Jacobson/Karels + Karn).
+        self._rto: dict[Address, RTOEstimator] = {}
+
+        # Send timestamp per outstanding seq (for RTT samples).
+        self._send_time: dict[Address, dict[int, float]] = {}
 
         # ============================================================
         # Sender state
@@ -506,6 +515,14 @@ class SelectiveRepeatTransport(Transport):
                 self._retries.setdefault(addr, 0)
                 self._retransmitted.setdefault(addr, set())
                 self._buffer.setdefault(addr, {})
+                self._rto.setdefault(
+                    addr,
+                    RTOEstimator(
+                        initial_rto=self.timeout,
+                        min_rto=min(0.1, self.timeout),
+                    ),
+                )
+                self._send_time.setdefault(addr, {})
 
     # ================================================================
     # Window pump
@@ -568,8 +585,16 @@ class SelectiveRepeatTransport(Transport):
 
                     self._sent_items[addr][seq] = item
 
+                    # Record the send time for RTT sampling.
+                    self._send_time.setdefault(addr, {})[seq] = (
+                        time.monotonic()
+                    )
+
                     # Start a timer for EACH packet sent.
-                    self._timer_heap.schedule((addr, seq), time.monotonic() + self.timeout)
+                    self._timer_heap.schedule(
+                        (addr, seq),
+                        time.monotonic() + self._rto_value(addr),
+                    )
 
                 # Do channel I/O outside the lock.
                 try:
@@ -658,7 +683,23 @@ class SelectiveRepeatTransport(Transport):
                     item["event"].set()
                     
                 self._timer_heap.cancel((addr, acked_seq))
-                
+
+                # Karn: per-packet SR ACKs are unambiguous, so a
+                # non-retransmitted packet's ACK is a clean RTT sample.
+                if self.adaptive:
+                    send_times = self._send_time.setdefault(addr, {})
+                    retransmitted = self._retransmitted.setdefault(
+                        addr, set()
+                    )
+                    if (
+                        acked_seq in send_times
+                        and acked_seq not in retransmitted
+                    ):
+                        rtt = max(1e-4, time.monotonic() - send_times[acked_seq])
+                        self._rto[addr].sample(rtt)
+                    send_times.pop(acked_seq, None)
+                    retransmitted.discard(acked_seq)
+
                 # Advance base past all acknowledged packets
                 while base < next_seq and base not in outstanding:
                     base += 1
@@ -670,6 +711,12 @@ class SelectiveRepeatTransport(Transport):
     # ================================================================
     # Timeout / retransmission
     # ================================================================
+
+    def _rto_value(self, addr: Address) -> float:
+        """Current retransmission timeout for a peer."""
+        if not self.adaptive:
+            return self.timeout
+        return self._rto[addr].rto
 
     def _handle_timeouts(self) -> None:
         """Retransmit specific unacknowledged packets after timeout."""
@@ -687,6 +734,11 @@ class SelectiveRepeatTransport(Transport):
                     
             for addr, seqs in due_by_addr.items():
                 self._retries[addr] = self._retries.get(addr, 0) + 1
+
+                # Exponential backoff (Karn's other half).
+                if self.adaptive:
+                    self._rto[addr].on_timeout()
+
                 if self._retries[addr] > MAX_RETRIES:
                     self._fail_peer(
                         addr,
@@ -708,7 +760,10 @@ class SelectiveRepeatTransport(Transport):
                     self._retransmitted.setdefault(addr, set()).add(seq)
                     
                     # Reschedule timer
-                    self._timer_heap.schedule((addr, seq), time.monotonic() + self.timeout)
+                    self._timer_heap.schedule(
+                        (addr, seq),
+                        time.monotonic() + self._rto_value(addr),
+                    )
                     
                     try:
                         self.channel.sendto(packet, addr)

@@ -738,7 +738,7 @@ class GoBackNTransport(Transport):
                     base in send_times
                     and base not in retransmitted
                 ):
-                    rtt = time.monotonic() - send_times[base]
+                    rtt = max(1e-4, time.monotonic() - send_times[base])
                     self._rto[addr].sample(rtt)
 
                 # Drop bookkeeping for everything now acknowledged.

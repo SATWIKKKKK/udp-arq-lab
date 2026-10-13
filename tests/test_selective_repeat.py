@@ -28,6 +28,7 @@ def make_pair(
     window_size: int = 4,
     receiver_loss: float = 0.0,
     receiver_seed: int | None = None,
+    **kwargs,
 ):
     """Create a sender/receiver SR pair."""
     sender_ch = Channel(
@@ -45,12 +46,14 @@ def make_pair(
         sender_ch,
         timeout=timeout,
         window_size=window_size,
+        **kwargs,
     )
 
     receiver = SelectiveRepeatTransport(
         receiver_ch,
         timeout=timeout,
         window_size=window_size,
+        **kwargs,
     )
 
     return sender, receiver
@@ -287,6 +290,35 @@ def test_zero_loss_has_zero_retransmissions() -> None:
 
         assert received == payloads
         assert sender.retransmissions == 0
+    finally:
+        sender.close()
+        receiver.close()
+
+
+@pytest.mark.parametrize("loss", [0.0, 0.10])
+def test_adaptive_rto_file_transfer(loss: float) -> None:
+    """Week 6 completion: adaptive RTO must not break correctness."""
+    data = os.urandom(32 * 1024)
+    chunks = chunk(data, mss=1024)
+
+    sender, receiver = make_pair(loss=loss, seed=99, timeout=0.1, adaptive=True)
+    try:
+        addr = receiver.channel.local_addr
+        received: list[bytes] = []
+
+        def receive_all() -> None:
+            for _ in chunks:
+                received.append(receiver.recvfrom(timeout=15.0)[0])
+
+        t = threading.Thread(target=receive_all)
+        t.start()
+        for piece in chunks:
+            sender.sendto(piece, addr)
+        sender.flush()
+        t.join(timeout=30.0)
+
+        assert len(received) == len(chunks)
+        assert sha256_hex(reassemble(received)) == sha256_hex(data)
     finally:
         sender.close()
         receiver.close()
