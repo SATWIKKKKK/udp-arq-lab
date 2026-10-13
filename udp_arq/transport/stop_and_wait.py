@@ -123,7 +123,7 @@ class StopAndWaitTransport(Transport):
                     # Karn: attempt 0 is the fresh transmission; later
                     # attempts are retransmits and must not be sampled.
                     if self.adaptive and attempt == 0:
-                        rto.sample(time.monotonic() - sent_at)
+                        rto.sample(max(1e-4, time.monotonic() - sent_at))
                     return
                 # Stale ACK for a previous packet: keep waiting for ours.
 
