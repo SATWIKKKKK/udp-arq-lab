@@ -515,6 +515,14 @@ class SelectiveRepeatTransport(Transport):
                 self._retries.setdefault(addr, 0)
                 self._retransmitted.setdefault(addr, set())
                 self._buffer.setdefault(addr, {})
+                self._rto.setdefault(
+                    addr,
+                    RTOEstimator(
+                        initial_rto=self.timeout,
+                        min_rto=min(0.1, self.timeout),
+                    ),
+                )
+                self._send_time.setdefault(addr, {})
 
     # ================================================================
     # Window pump
