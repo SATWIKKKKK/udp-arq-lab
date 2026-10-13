@@ -87,6 +87,7 @@ class SelectiveRepeatTransport(Transport):
         mss: int = DEFAULT_MSS,
         timeout: float = 0.5,
         window_size: int = 4,
+        adaptive: bool = False,
     ):
         super().__init__(
             channel,
@@ -98,6 +99,13 @@ class SelectiveRepeatTransport(Transport):
             raise ValueError("window_size must be greater than zero")
 
         self.window_size = window_size
+        self.adaptive = adaptive
+
+        # RTO estimator per peer (Jacobson/Karels + Karn).
+        self._rto: dict[Address, RTOEstimator] = {}
+
+        # Send timestamp per outstanding seq (for RTT samples).
+        self._send_time: dict[Address, dict[int, float]] = {}
 
         # ============================================================
         # Sender state
