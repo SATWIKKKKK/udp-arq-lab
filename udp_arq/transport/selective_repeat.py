@@ -683,7 +683,23 @@ class SelectiveRepeatTransport(Transport):
                     item["event"].set()
                     
                 self._timer_heap.cancel((addr, acked_seq))
-                
+
+                # Karn: per-packet SR ACKs are unambiguous, so a
+                # non-retransmitted packet's ACK is a clean RTT sample.
+                if self.adaptive:
+                    send_times = self._send_time.setdefault(addr, {})
+                    retransmitted = self._retransmitted.setdefault(
+                        addr, set()
+                    )
+                    if (
+                        acked_seq in send_times
+                        and acked_seq not in retransmitted
+                    ):
+                        rtt = time.monotonic() - send_times[acked_seq]
+                        self._rto[addr].sample(rtt)
+                    send_times.pop(acked_seq, None)
+                    retransmitted.discard(acked_seq)
+
                 # Advance base past all acknowledged packets
                 while base < next_seq and base not in outstanding:
                     base += 1
@@ -695,6 +711,12 @@ class SelectiveRepeatTransport(Transport):
     # ================================================================
     # Timeout / retransmission
     # ================================================================
+
+    def _rto_value(self, addr: Address) -> float:
+        """Current retransmission timeout for a peer."""
+        if not self.adaptive:
+            return self.timeout
+        return self._rto[addr].rto
 
     def _handle_timeouts(self) -> None:
         """Retransmit specific unacknowledged packets after timeout."""
