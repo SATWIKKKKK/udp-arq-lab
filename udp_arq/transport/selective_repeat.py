@@ -734,6 +734,11 @@ class SelectiveRepeatTransport(Transport):
                     
             for addr, seqs in due_by_addr.items():
                 self._retries[addr] = self._retries.get(addr, 0) + 1
+
+                # Exponential backoff (Karn's other half).
+                if self.adaptive:
+                    self._rto[addr].on_timeout()
+
                 if self._retries[addr] > MAX_RETRIES:
                     self._fail_peer(
                         addr,
@@ -755,7 +760,10 @@ class SelectiveRepeatTransport(Transport):
                     self._retransmitted.setdefault(addr, set()).add(seq)
                     
                     # Reschedule timer
-                    self._timer_heap.schedule((addr, seq), time.monotonic() + self.timeout)
+                    self._timer_heap.schedule(
+                        (addr, seq),
+                        time.monotonic() + self._rto_value(addr),
+                    )
                     
                     try:
                         self.channel.sendto(packet, addr)
