@@ -585,8 +585,16 @@ class SelectiveRepeatTransport(Transport):
 
                     self._sent_items[addr][seq] = item
 
+                    # Record the send time for RTT sampling.
+                    self._send_time.setdefault(addr, {})[seq] = (
+                        time.monotonic()
+                    )
+
                     # Start a timer for EACH packet sent.
-                    self._timer_heap.schedule((addr, seq), time.monotonic() + self.timeout)
+                    self._timer_heap.schedule(
+                        (addr, seq),
+                        time.monotonic() + self._rto_value(addr),
+                    )
 
                 # Do channel I/O outside the lock.
                 try:
