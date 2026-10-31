@@ -15,6 +15,7 @@ from udp_arq.channel import Channel
 from udp_arq.checksum import checksum
 from udp_arq.file_layer import chunk, reassemble, sha256_hex
 from udp_arq.packet import FLAG_DATA, Header, encode
+from udp_arq.transport import selective_repeat as sr_module
 from udp_arq.transport.selective_repeat import SelectiveRepeatTransport
 
 LOCALHOST = ("127.0.0.1", 0)
@@ -319,6 +320,22 @@ def test_adaptive_rto_file_transfer(loss: float) -> None:
 
         assert len(received) == len(chunks)
         assert sha256_hex(reassemble(received)) == sha256_hex(data)
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_unreachable_peer_fails_cleanly(monkeypatch) -> None:
+    """The retry cap must surface TimeoutError instead of crashing."""
+    monkeypatch.setattr(sr_module, "MAX_RETRIES", 1)
+    sender, receiver = make_pair(loss=1.0, seed=0, timeout=0.01)
+
+    try:
+        addr = receiver.channel.local_addr
+        sender.sendto(b"never-acked", addr)
+
+        with pytest.raises(TimeoutError):
+            sender.flush(timeout=2.0)
     finally:
         sender.close()
         receiver.close()

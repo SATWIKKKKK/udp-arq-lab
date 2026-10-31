@@ -2,8 +2,9 @@
 
 Selective Repeat provides reliable delivery using a sliding window.
 
-Multiple DATA packets may be outstanding at once. ACKs are cumulative:
-an ACK value represents the next sequence number expected by the receiver.
+Multiple DATA packets may be outstanding at once. ACKs are individual:
+an ACK value represents the packet that was received (``ack = seq + 1``),
+so a lost ACK causes only that packet to be retransmitted.
 
 sendto() places data into an internal outbound queue and returns
 immediately; flush() waits until every datagram handed over so far has
@@ -142,6 +143,9 @@ class SelectiveRepeatTransport(Transport):
 
         # Number of consecutive timeout events per peer (for max retries).
         self._retries: dict[Address, int] = {}
+
+        # Sticky failure per peer so a later flush() still reports it.
+        self._peer_errors: dict[Address, Exception] = {}
         
         # Track which packets have been retransmitted (for week 6 Karn's algorithm).
         self._retransmitted: dict[Address, set[int]] = {}
@@ -210,6 +214,9 @@ class SelectiveRepeatTransport(Transport):
             raise RuntimeError("transport is closed")
 
         with self._lock:
+            # A new datagram starts a fresh attempt for this peer.
+            self._peer_errors.pop(addr, None)
+
             # Assign sequence number immediately.
             seq = self._next_seq.get(addr, 0)
             self._next_seq[addr] = seq + 1
@@ -217,7 +224,7 @@ class SelectiveRepeatTransport(Transport):
             # Each sendto() call owns an Event.
             #
             # The ACK handler sets this Event once the sequence number
-            # is cumulatively acknowledged.
+            # is acknowledged by the receiver.
             item = {
                 "addr": addr,
                 "seq": seq,
@@ -255,7 +262,14 @@ class SelectiveRepeatTransport(Transport):
                     addrs = sorted(
                         set(self._pending)
                         | set(self._sent_items)
+                        | set(self._peer_errors)
                     )
+
+                peer_errors = [
+                    self._peer_errors[a]
+                    for a in addrs
+                    if a in self._peer_errors
+                ]
 
                 items: list[dict] = []
 
@@ -272,7 +286,7 @@ class SelectiveRepeatTransport(Transport):
                         list(self._outbound.queue)
                     )
 
-            errors = [
+            errors = peer_errors + [
                 item["error"]
                 for item in items
                 if item["error"] is not None
@@ -312,7 +326,7 @@ class SelectiveRepeatTransport(Transport):
             - verified the checksum,
             - decoded the packet,
             - checked its sequence number,
-            - sent the appropriate cumulative ACK.
+            - sent the appropriate individual ACK.
 
         Therefore recvfrom() only needs to consume the payload queue.
         """
@@ -631,7 +645,7 @@ class SelectiveRepeatTransport(Transport):
         raw: bytes,
         addr: Address,
     ) -> None:
-        """Process one verified cumulative ACK."""
+        """Process one verified individual ACK."""
 
         try:
             header, _ = decode(raw)
@@ -834,12 +848,15 @@ class SelectiveRepeatTransport(Transport):
 
             pending.clear()
 
-            self._outstanding.get(
-                addr,
-                {},
-            ).clear()
+            outstanding = self._outstanding.get(addr, {})
 
-            self._timer_deadline[addr] = None
+            for seq in list(outstanding):
+                self._timer_heap.cancel((addr, seq))
+
+            outstanding.clear()
+            self._send_time.get(addr, {}).clear()
+            self._retransmitted.get(addr, set()).clear()
+            self._peer_errors.setdefault(addr, error)
 
     # ================================================================
     # Shutdown

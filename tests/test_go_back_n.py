@@ -19,6 +19,7 @@ from udp_arq.channel import Channel
 from udp_arq.checksum import checksum
 from udp_arq.file_layer import chunk, reassemble, sha256_hex
 from udp_arq.packet import FLAG_DATA, Header, encode
+from udp_arq.transport import go_back_n as gbn_module
 from udp_arq.transport.go_back_n import GoBackNTransport
 
 
@@ -368,6 +369,22 @@ def test_window_pipelines_multiple_datagrams() -> None:
         # A working window keeps it well below that.
         assert elapsed < 2.0
 
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_unreachable_peer_fails_cleanly(monkeypatch) -> None:
+    """The retry cap must surface TimeoutError instead of hanging."""
+    monkeypatch.setattr(gbn_module, "MAX_RETRIES", 1)
+    sender, receiver = make_pair(loss=1.0, seed=0, timeout=0.01)
+
+    try:
+        addr = receiver.channel.local_addr
+        sender.sendto(b"never-acked", addr)
+
+        with pytest.raises(TimeoutError):
+            sender.flush(timeout=2.0)
     finally:
         sender.close()
         receiver.close()

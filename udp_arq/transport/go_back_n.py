@@ -136,6 +136,9 @@ class GoBackNTransport(Transport):
         # Number of timeout retransmissions for the current window.
         self._retries: dict[Address, int] = {}
 
+        # Sticky failure per peer so a later flush() still reports it.
+        self._peer_errors: dict[Address, Exception] = {}
+
         # ============================================================
         # Adaptive RTO state (Jacobson/Karels + Karn).
         #
@@ -212,6 +215,9 @@ class GoBackNTransport(Transport):
             raise RuntimeError("transport is closed")
 
         with self._lock:
+            # A new datagram starts a fresh attempt for this peer.
+            self._peer_errors.pop(addr, None)
+
             # Assign sequence number immediately.
             seq = self._next_seq.get(addr, 0)
             self._next_seq[addr] = seq + 1
@@ -257,7 +263,14 @@ class GoBackNTransport(Transport):
                     addrs = sorted(
                         set(self._pending)
                         | set(self._sent_items)
+                        | set(self._peer_errors)
                     )
+
+                peer_errors = [
+                    self._peer_errors[a]
+                    for a in addrs
+                    if a in self._peer_errors
+                ]
 
                 items: list[dict] = []
 
@@ -274,7 +287,7 @@ class GoBackNTransport(Transport):
                         list(self._outbound.queue)
                     )
 
-            errors = [
+            errors = peer_errors + [
                 item["error"]
                 for item in items
                 if item["error"] is not None
@@ -945,6 +958,7 @@ class GoBackNTransport(Transport):
             ).clear()
 
             self._timer_deadline[addr] = None
+            self._peer_errors.setdefault(addr, error)
 
     # ================================================================
     # Shutdown

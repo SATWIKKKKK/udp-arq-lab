@@ -33,7 +33,7 @@ LOCALHOST = ("127.0.0.1", 0)
 
 def _sr_or_skip(channel, **kwargs):
     if not SR_AVAILABLE:
-        pytest.skip("Selective Repeat not merged yet")
+        pytest.skip("Selective Repeat transport unavailable")
     return SelectiveRepeatTransport(channel, **kwargs)
 
 
@@ -54,8 +54,8 @@ def make_pair(proto, *, loss=0.0, seed=None, timeout=0.2, **kwargs):
 
 
 def flush_if_possible(sender) -> None:
-    """GBN (and later SR) confirm delivery via flush(); Stop-and-Wait's
-    sendto already blocks until ACKed."""
+    """GBN and SR confirm delivery via flush(); Stop-and-Wait's sendto
+    already blocks until ACKed."""
     flush = getattr(sender, "flush", None)
     if flush is not None:
         flush()
@@ -187,11 +187,10 @@ def test_file_transfer_sha256_matches(proto, loss):
         receiver.close()
 
 
-@pytest.mark.parametrize("proto", ["stopwait", "gbn"])
+@pytest.mark.parametrize("proto", sorted(PROTOCOLS))
 @pytest.mark.parametrize("loss", [0.0, 0.10])
 def test_adaptive_rto_file_transfer(proto, loss):
-    """Adaptive RTO (Jacobson/Karels + Karn) must not break correctness.
-    SR joins this list once Sagnik wires the ``adaptive`` kwarg there."""
+    """Adaptive RTO (Jacobson/Karels + Karn) must not break correctness."""
     data = os.urandom(32 * 1024)
     chunks_ = chunk(data, mss=1024)
 

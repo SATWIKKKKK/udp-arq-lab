@@ -1,8 +1,9 @@
 # udp-arq-lab
 
-Reliable data transfer over an unreliable UDP channel. **Week 3 target:**
-Stop-and-Wait through the emulator at 0% and then 10% loss, with SHA-256
-matching on both ends. Go-Back-N and Selective Repeat follow in later weeks.
+Reliable data transfer over an unreliable UDP channel. The lab ships
+Stop-and-Wait, Go-Back-N, and Selective Repeat transports, plus adaptive
+RTO estimation. Every protocol is validated through the channel emulator
+at 0% and 10% loss with SHA-256 matching on both ends.
 
 ## Team and ownership
 
@@ -124,6 +125,33 @@ Done when: Stop-and-Wait moves a file through the emulator at 0% loss,
 then 10% loss, with SHA-256 matching on both ends
 (`tests/test_stop_and_wait.py::test_file_transfer_sha256_matches`).
 
+## Go-Back-N transport
+
+`GoBackNTransport(Transport)`: sliding window with cumulative ACKs
+(`ack` = next sequence number expected). `sendto` queues a datagram and
+returns immediately; `flush()` waits until everything sent so far is
+cumulatively acknowledged. On timeout the sender retransmits the whole
+outstanding window. The receiver accepts in-order DATA, ACKs duplicates,
+and buffers nothing out of order. `window_size` defaults to 4.
+
+## Selective Repeat transport
+
+`SelectiveRepeatTransport(Transport)`: sliding window with individual
+ACKs (`ack = seq + 1`). The receiver buffers out-of-order DATA and
+delivers it in sequence order through `recvfrom`. A lost ACK causes only
+that packet to be retransmitted rather than the whole window. Each
+outstanding packet has its own timer, managed by `udp_arq/timer_heap.py`.
+Like GBN, `sendto` queues and `flush()` confirms delivery.
+
+## Adaptive RTO (all transports)
+
+`udp_arq/rto.py` implements a Jacobson/Karels `RTOEstimator` (RFC 6298
+simplified): SRTT/RTTVAR smoothing, `RTO = SRTT + max(G, 4 * RTTVAR)`,
+exponential backoff on timeout, and min/max clamps. Karn's algorithm is
+applied in each transport so ACKs for retransmitted packets never produce
+RTT samples. Pass `adaptive=True` to any transport; the default fixed
+`timeout` path is unchanged.
+
 ## File layer + transfer harness (Pratik + Sagnik)
 
 - `chunk(data, mss=DEFAULT_MSS) -> list[bytes]`
@@ -147,12 +175,16 @@ udp-arq-lab/
 │   ├── checksum.py       # Pratik
 │   ├── file_layer.py     # Pratik
 │   ├── channel.py        # Ahana
+│   ├── rto.py            # Pratik — adaptive RTO estimator
+│   ├── timer_heap.py     # Sagnik — per-packet timers
 │   └── transport/
 │       ├── __init__.py
 │       ├── base.py             # Sagnik — frozen interface
 │       ├── null.py             # Sagnik — passthrough proof
-│       └── stop_and_wait.py    # Satwik — week 3 target
-└── tests/                # Pratik & Sagnik (+ packet/channel/S&W self-tests)
+│       ├── stop_and_wait.py    # Satwik — alternating-bit ARQ
+│       ├── go_back_n.py        # Pratik — sliding window, cumulative ACK
+│       └── selective_repeat.py # Sagnik — per-packet ACK + timers
+└── tests/                # protocol, impairment, and cross-protocol suites
 ```
 
 ## Run tests
@@ -176,6 +208,15 @@ python -m pytest -q
   start line.
 - **Week 3 target** — ✅ Stop-and-Wait at 0%, then 10% loss, SHA-256
   matching. (`tests/test_stop_and_wait.py::test_file_transfer_sha256_matches`)
+- **Go-Back-N** — ✅ sliding window, pipelining, cumulative ACKs,
+  duplicate suppression, and 0%/10% loss file transfer with SHA-256 match.
+  (`tests/test_go_back_n.py`, `tests/test_correctness.py`)
+- **Selective Repeat** — ✅ individual ACKs, out-of-order buffering,
+  selective retransmission only, and 0%/10% loss file transfer with
+  SHA-256 match. (`tests/test_selective_repeat.py`, `tests/test_correctness.py`)
+- **Adaptive RTO** — ✅ Jacobson/Karels + Karn wired into all three
+  transports and validated at 0%/10% loss.
+  (`tests/test_rto.py`, `tests/test_correctness.py::test_adaptive_rto_file_transfer`)
 
 ## Git rules (from kickoff)
 
